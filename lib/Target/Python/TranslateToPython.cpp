@@ -459,6 +459,17 @@ static LogicalResult printOperation(PythonEmitter &emitter,
   };
 
   bool list = callee == "util_create_list";
+  if (callee == "util_method_remove") {
+    if (op.getNumOperands() != 2 || callOpaqueOp.getArgs())
+      return op.emitOpError("expected receiver and item for remove");
+    if (failed(emitter.emitOperand(op.getOperand(0), "receiver")))
+      return failure();
+    os << ".remove(";
+    if (failed(emitter.emitOperand(op.getOperand(1), "item")))
+      return failure();
+    os << ")";
+    return success();
+  }
   if (list) {
     os << "[";
   } else {

@@ -9,6 +9,7 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Support/ToolUtilities.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
@@ -68,13 +69,14 @@ struct Lowering {
   }
 };
 
-bool hasTypes(TypeRange types, ArrayRef<StringRef> names) {
+bool hasTypes(TypeRange types, ArrayRef<StringRef> names,
+              StringRef dialect = "d02") {
   if (types.size() != names.size())
     return false;
   for (auto [type, name] : llvm::zip(types, names)) {
     auto dynamic = dyn_cast<DynamicType>(type);
     if (!dynamic || dynamic.getTypeDef()->getName() != name ||
-        dynamic.getDialect().getNamespace() != "d02")
+        dynamic.getDialect().getNamespace() != dialect)
       return false;
   }
   return true;
@@ -82,10 +84,16 @@ bool hasTypes(TypeRange types, ArrayRef<StringRef> names) {
 
 LogicalResult lower(ModuleOp input, ModuleOp output, unsigned index) {
   auto fn = input.lookupSymbol<func::FuncOp>("candidate");
-  if (!fn || fn.isDeclaration() || !llvm::hasSingleElement(fn.getBody()) ||
-      !hasTypes(fn.getArgumentTypes(), {"dict", "key", "value", "dict"}) ||
-      !hasTypes(fn.getResultTypes(), {"value"}))
-    return input.emitError("unsupported D02 candidate signature or control flow");
+  if (!fn || fn.isDeclaration() || !llvm::hasSingleElement(fn.getBody()))
+    return input.emitError("unsupported candidate control flow");
+  bool bag = fn.getNumArguments() == 3 &&
+             hasTypes(fn.getArgumentTypes().take_front(2), {"bag", "bag"}, "pyrsbag") &&
+             fn.getArgumentTypes()[2].isInteger(64) &&
+             fn.getFunctionType().getNumResults() == 1 &&
+             fn.getResultTypes()[0].isInteger(64);
+  if (!bag && (!hasTypes(fn.getArgumentTypes(), {"dict", "key", "value", "dict"}) ||
+               !hasTypes(fn.getResultTypes(), {"value"})))
+    return input.emitError("unsupported candidate signature");
   for (Operation &top : *input.getBody())
     if (&top != fn.getOperation() &&
         (!isa<func::FuncOp>(top) || !cast<func::FuncOp>(top).isDeclaration()))
@@ -96,7 +104,8 @@ LogicalResult lower(ModuleOp input, ModuleOp output, unsigned index) {
   auto obj = py::OpaqueType::get(output.getContext(), "object");
   auto function = b.create<func::FuncOp>(
       fn.getLoc(), "route" + std::to_string(index),
-      b.getFunctionType({obj, obj, obj, obj}, {obj, obj}));
+      bag ? b.getFunctionType({obj, obj, obj}, {obj})
+          : b.getFunctionType({obj, obj, obj, obj}, {obj, obj}));
   auto *block = function.addEntryBlock();
   b.setInsertionPointToStart(block);
   DenseMap<Value, Value> values;
@@ -106,6 +115,12 @@ LogicalResult lower(ModuleOp input, ModuleOp output, unsigned index) {
   SmallVector<Value, 2> fields;
   for (Operation &op : fn.getBody().front()) {
     if (auto ret = dyn_cast<func::ReturnOp>(op)) {
+      if (bag) {
+        if (ret.getNumOperands() != 1 || !values.lookup(ret.getOperand(0)))
+          return op.emitError("expected a supported PBag result");
+        b.create<func::ReturnOp>(op.getLoc(), values.lookup(ret.getOperand(0)));
+        continue;
+      }
       if (!pair || ret.getNumOperands() != 1 || ret.getOperand(0) != pair)
         return op.emitError("expected return of the observed pair");
       b.create<func::ReturnOp>(op.getLoc(), fields);
@@ -130,7 +145,28 @@ LogicalResult lower(ModuleOp input, ModuleOp output, unsigned index) {
     auto results = call->getResultTypes();
     StringRef name = call.getCallee();
     Value result;
-    if ((name == "get_default" || name == "get_strict") &&
+    if (bag) {
+      auto bagTypes = [](TypeRange ts, ArrayRef<StringRef> names) {
+        return hasTypes(ts, names, "pyrsbag");
+      };
+      if (name == "length" && bagTypes(types, {"bag"}) && results[0].isInteger(64)) {
+        result = adapter.call("len", operands);
+      } else if (name == "remove" && types.size() == 2 &&
+                 bagTypes(TypeRange(types).take_front(1), {"bag"}) && types[1].isInteger(64) &&
+                 bagTypes(results, {"bag"})) {
+        result = adapter.call("util_method_remove", operands);
+      } else if (bagTypes(types, {"bag", "bag"}) && bagTypes(results, {"bag"})) {
+        StringRef callee = llvm::StringSwitch<StringRef>(name)
+            .Case("add", "_operator.add").Case("subtract", "_operator.sub")
+            .Case("intersect", "_operator.and_").Case("union", "_operator.or_")
+            .Default("");
+        if (callee.empty())
+          return op.emitError("unsupported PBag call: ") << name;
+        result = adapter.call(callee, operands);
+      } else {
+        return op.emitError("unsupported PBag call or signature: ") << name;
+      }
+    } else if ((name == "get_default" || name == "get_strict") &&
         hasTypes(types, {"dict", "key"}) && hasTypes(results, {"value"})) {
       result = adapter.lookup(operands, name == "get_strict");
     } else if (name == "observe_pair" && hasTypes(types, {"value", "value"}) &&
@@ -168,14 +204,18 @@ int translate(MLIRContext &context, std::unique_ptr<llvm::MemoryBuffer> buffer,
   auto loc = b.getUnknownLoc();
   OwningOpRef<ModuleOp> output(ModuleOp::create(loc));
   b.setInsertionPointToStart(output->getBody());
-  OperationState import(loc, py::ImportOp::getOperationName());
-  import.addAttribute("module_name", b.getStringAttr("toolz.dicttoolz"));
-  import.addAttribute("module_alias", b.getStringAttr("_toolz"));
-  b.create(import);
-  OperationState helperImport(loc, py::ImportOp::getOperationName());
-  helperImport.addAttribute("module_name", b.getStringAttr("functools"));
-  helperImport.addAttribute("module_alias", b.getStringAttr("_functools"));
-  b.create(helperImport);
+  auto addImport = [&](StringRef module, StringRef alias) {
+    OperationState import(loc, py::ImportOp::getOperationName());
+    import.addAttribute("module_name", b.getStringAttr(module));
+    import.addAttribute("module_alias", b.getStringAttr(alias));
+    b.create(import);
+  };
+  if (context.getLoadedDialect("pyrsbag"))
+    addImport("operator", "_operator");
+  if (context.getLoadedDialect("d02")) {
+    addImport("toolz.dicttoolz", "_toolz");
+    addImport("functools", "_functools");
+  }
   unsigned index = 0;
   const auto prepared = Clock::now();
   Nanoseconds parseTime{}, lowerTime{};
