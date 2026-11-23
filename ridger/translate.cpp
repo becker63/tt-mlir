@@ -12,6 +12,8 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
+#include <chrono>
+#include <cstdlib>
 
 using namespace mlir;
 namespace py = mlir::tt::emitpy;
@@ -157,7 +159,7 @@ LogicalResult lower(ModuleOp input, ModuleOp output, unsigned index) {
 
 int main(int argc, char **argv) {
   if (argc != 3) {
-    llvm::errs() << "usage: ridger-emitpy IRDL INPUT\n";
+    llvm::errs() << "usage: ridger-emitpy IRDL INPUT | --literal STRING\n";
     return 2;
   }
   DialectRegistry registry;
@@ -175,6 +177,9 @@ int main(int argc, char **argv) {
     return failed(verify(*output)) ||
            failed(py::translateToPython(output->getOperation(), llvm::outs()));
   }
+  using Clock = std::chrono::steady_clock;
+  using Nanoseconds = std::chrono::nanoseconds;
+  const auto started = Clock::now();
   auto definitions = parseSourceFile<ModuleOp>(argv[1], &context);
   if (!definitions || failed(irdl::loadDialects(*definitions)))
     return 1;
@@ -197,15 +202,38 @@ int main(int argc, char **argv) {
   helperImport.addAttribute("module_alias", b.getStringAttr("_functools"));
   b.create(helperImport);
   unsigned index = 0;
-  return failed(splitAndProcessBuffer(
+  const auto prepared = Clock::now();
+  Nanoseconds parseTime{}, lowerTime{};
+  if (failed(splitAndProcessBuffer(
       std::move(*buffer),
       [&](std::unique_ptr<llvm::MemoryBuffer> chunk, llvm::raw_ostream &) {
         llvm::SourceMgr source;
         source.AddNewSourceBuffer(std::move(chunk), llvm::SMLoc());
+        const auto begin = Clock::now();
         auto input = parseSourceFile<ModuleOp>(source, &context);
-        return input ? lower(*input, *output, index++) : failure();
+        const auto parsed = Clock::now();
+        auto result = input ? lower(*input, *output, index++) : failure();
+        parseTime += std::chrono::duration_cast<Nanoseconds>(parsed - begin);
+        lowerTime += std::chrono::duration_cast<Nanoseconds>(Clock::now() - parsed);
+        return result;
       },
-      llvm::nulls())) ||
-      failed(verify(*output)) ||
-      failed(py::translateToPython(output->getOperation(), llvm::outs()));
+      llvm::nulls())))
+    return 1;
+  const auto checking = Clock::now();
+  if (failed(verify(*output)))
+    return 1;
+  const auto emitting = Clock::now();
+  if (failed(py::translateToPython(output->getOperation(), llvm::outs())))
+    return 1;
+  llvm::outs().flush();
+  if (std::getenv("RIDGER_EMITPY_PROFILE")) {
+    llvm::errs() << "graphs=" << index
+                 << " setup_ns=" << std::chrono::duration_cast<Nanoseconds>(prepared - started).count()
+                 << " parse_verify_ns=" << parseTime.count()
+                 << " conversion_ns=" << lowerTime.count()
+                 << " emitpy_verify_ns=" << std::chrono::duration_cast<Nanoseconds>(emitting - checking).count()
+                 << " translation_ns=" << std::chrono::duration_cast<Nanoseconds>(Clock::now() - emitting).count()
+                 << '\n';
+  }
+  return 0;
 }
