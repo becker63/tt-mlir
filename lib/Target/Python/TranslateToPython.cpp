@@ -429,6 +429,33 @@ static LogicalResult printOperation(PythonEmitter &emitter,
   raw_indented_ostream &os = emitter.ostream();
   Operation &op = *callOpaqueOp.getOperation();
   StringRef callee = callOpaqueOp.getCallee();
+  if (callee == "util_remove_or_add") {
+    if (op.getNumOperands() != 3 || op.getNumResults() != 1 || callOpaqueOp.getArgs())
+      return op.emitOpError("expected receiver, item and fallback bag");
+    os << "try:\n";
+    os.indent();
+    if (failed(emitter.emitAssignPrefix(op)) ||
+        failed(emitter.emitOperand(op.getOperand(0), "receiver")))
+      return failure();
+    os << ".remove(";
+    if (failed(emitter.emitOperand(op.getOperand(1), "item")))
+      return failure();
+    os << ")\n";
+    os.unindent();
+    os << "except KeyError:\n";
+    os.indent();
+    if (failed(emitter.emitAssignPrefix(op)))
+      return failure();
+    os << "_operator.add(";
+    if (failed(emitter.emitOperand(op.getOperand(0), "receiver")))
+      return failure();
+    os << ", ";
+    if (failed(emitter.emitOperand(op.getOperand(2), "fallback")))
+      return failure();
+    os << ")";
+    os.unindent();
+    return success();
+  }
   if (failed(emitter.emitAssignPrefix(op))) {
     return failure();
   }

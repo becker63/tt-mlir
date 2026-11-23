@@ -151,6 +151,15 @@ LogicalResult lower(ModuleOp input, ModuleOp output, unsigned index) {
       };
       if (name == "length" && bagTypes(types, {"bag"}) && results[0].isInteger(64)) {
         result = adapter.call("len", operands);
+      } else if (name == "remove_or_add" && types.size() == 3 &&
+                 bagTypes(TypeRange(types).take_front(1), {"bag"}) &&
+                 types[1].isInteger(64) &&
+                 bagTypes(TypeRange(types).drop_front(2), {"bag"}) &&
+                 bagTypes(results, {"bag"})) {
+        auto contract = declaration->getAttrOfType<StringAttr>("ridger.contract");
+        if (!contract || contract.getValue() != "pbag-remove-catch-keyerror-v1")
+          return op.emitError("missing PBag exception contract");
+        result = adapter.call("util_remove_or_add", operands);
       } else if (name == "remove" && types.size() == 2 &&
                  bagTypes(TypeRange(types).take_front(1), {"bag"}) && types[1].isInteger(64) &&
                  bagTypes(results, {"bag"})) {
