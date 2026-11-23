@@ -109,7 +109,7 @@ def EmitPy_LiteralOp : EmitPy_Op<"literal", [Pure, PyExpressionInterface]> {
   let assemblyFormat = "$value attr-dict `:` type($result)";
 }
 
-def EmitPy_SubscriptOp : EmitPy_Op<"subscript", [Pure, PyExpressionInterface]> {
+def EmitPy_SubscriptOp : EmitPy_Op<"subscript", [PyExpressionInterface]> {
   let summary = "Subscript operation";
   let description = [{
     The `emitpy.subscript` operation represents Python subscript access.
@@ -147,7 +147,7 @@ def EmitPy_SubscriptOp : EmitPy_Op<"subscript", [Pure, PyExpressionInterface]> {
   let assemblyFormat = "$container `[` $index `]` attr-dict `:` functional-type(operands, results)";
 }
 
-def EmitPy_GetAttrOp : EmitPy_Op<"get_attr", [Pure, PyExpressionInterface]> {
+def EmitPy_GetAttrOp : EmitPy_Op<"get_attr", [PyExpressionInterface]> {
   let summary = "Get attribute from an object";
   let description = [{
     The `emitpy.get_attr` operation represents Python attribute access

@@ -458,27 +458,23 @@ static LogicalResult printOperation(PythonEmitter &emitter,
     return success();
   };
 
-  if (callee == "util_create_list") {
+  bool list = callee == "util_create_list";
+  if (list) {
     os << "[";
-    if (failed(emitter.emitOperands(op))) {
-      return failure();
-    }
-    os << "]";
   } else {
     os << callee << "(";
-    LogicalResult emittedArgs = success();
-    if (callOpaqueOp.getArgs()) {
-      auto args =
-          llvm::zip(*callOpaqueOp.getArgs(), *callOpaqueOp.getKeywordArgs());
-      emittedArgs = interleaveCommaWithError(args, os, emitArgs);
-    } else {
-      emittedArgs = emitter.emitOperands(op);
-    }
-    if (failed(emittedArgs)) {
-      return failure();
-    }
-    os << ")";
   }
+  LogicalResult emittedArgs = success();
+  if (callOpaqueOp.getArgs()) {
+    auto args =
+        llvm::zip(*callOpaqueOp.getArgs(), *callOpaqueOp.getKeywordArgs());
+    emittedArgs = interleaveCommaWithError(args, os, emitArgs);
+  } else {
+    emittedArgs = emitter.emitOperands(op);
+  }
+  if (failed(emittedArgs))
+    return failure();
+  os << (list ? "]" : ")");
 
   return success();
 }
@@ -1234,6 +1230,10 @@ LogicalResult PythonEmitter::emitAttribute(Location loc, Attribute attr) {
   };
   // Print integer attributes.
   if (auto iAttr = dyn_cast<IntegerAttr>(attr)) {
+    if (iAttr.getType().isInteger(1)) {
+      os << (iAttr.getValue().isZero() ? "False" : "True");
+      return success();
+    }
     os << printInt(iAttr.getValue());
     return success();
   }
@@ -1253,7 +1253,17 @@ LogicalResult PythonEmitter::emitAttribute(Location loc, Attribute attr) {
   }
   // Print string attributes.
   if (auto sAttr = dyn_cast<StringAttr>(attr)) {
-    os << "\"" << sAttr.getValue() << "\"";
+    constexpr char hex[] = "0123456789abcdef";
+    os << '"';
+    for (unsigned char ch : sAttr.getValue().bytes()) {
+      if (ch == '"' || ch == '\\')
+        os << '\\' << static_cast<char>(ch);
+      else if (ch < 32 || ch == 127)
+        os << "\\x" << hex[ch >> 4] << hex[ch & 15];
+      else
+        os << static_cast<char>(ch);
+    }
+    os << '"';
     return success();
   }
   // Print opaque attributes.
