@@ -14,6 +14,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <chrono>
 #include <cstdlib>
+#include <iostream>
 
 using namespace mlir;
 namespace py = mlir::tt::emitpy;
@@ -157,38 +158,12 @@ LogicalResult lower(ModuleOp input, ModuleOp output, unsigned index) {
 }
 } // namespace
 
-int main(int argc, char **argv) {
-  if (argc != 3) {
-    llvm::errs() << "usage: ridger-emitpy IRDL INPUT | --literal STRING\n";
-    return 2;
-  }
-  DialectRegistry registry;
-  registry.insert<func::FuncDialect, irdl::IRDLDialect, py::EmitPyDialect>();
-  MLIRContext context(registry);
-  context.disableMultithreading();
-  context.getOrLoadDialect<py::EmitPyDialect>();
-  if (StringRef(argv[1]) == "--literal") {
-    OpBuilder b(&context);
-    auto loc = b.getUnknownLoc();
-    OwningOpRef<ModuleOp> output(ModuleOp::create(loc));
-    b.setInsertionPointToStart(output->getBody());
-    Lowering adapter{b, loc, py::OpaqueType::get(&context, "object")};
-    adapter.path({argv[2]});
-    return failed(verify(*output)) ||
-           failed(py::translateToPython(output->getOperation(), llvm::outs()));
-  }
+namespace {
+int translate(MLIRContext &context, std::unique_ptr<llvm::MemoryBuffer> buffer,
+              llvm::raw_ostream &destination) {
   using Clock = std::chrono::steady_clock;
   using Nanoseconds = std::chrono::nanoseconds;
   const auto started = Clock::now();
-  auto definitions = parseSourceFile<ModuleOp>(argv[1], &context);
-  if (!definitions || failed(irdl::loadDialects(*definitions)))
-    return 1;
-  auto buffer = llvm::MemoryBuffer::getFileOrSTDIN(argv[2]);
-  if (!buffer) {
-    llvm::errs() << buffer.getError().message() << '\n';
-    return 1;
-  }
-
   OpBuilder b(&context);
   auto loc = b.getUnknownLoc();
   OwningOpRef<ModuleOp> output(ModuleOp::create(loc));
@@ -205,7 +180,7 @@ int main(int argc, char **argv) {
   const auto prepared = Clock::now();
   Nanoseconds parseTime{}, lowerTime{};
   if (failed(splitAndProcessBuffer(
-      std::move(*buffer),
+      std::move(buffer),
       [&](std::unique_ptr<llvm::MemoryBuffer> chunk, llvm::raw_ostream &) {
         llvm::SourceMgr source;
         source.AddNewSourceBuffer(std::move(chunk), llvm::SMLoc());
@@ -223,9 +198,9 @@ int main(int argc, char **argv) {
   if (failed(verify(*output)))
     return 1;
   const auto emitting = Clock::now();
-  if (failed(py::translateToPython(output->getOperation(), llvm::outs())))
+  if (failed(py::translateToPython(output->getOperation(), destination)))
     return 1;
-  llvm::outs().flush();
+  destination.flush();
   if (std::getenv("RIDGER_EMITPY_PROFILE")) {
     llvm::errs() << "graphs=" << index
                  << " setup_ns=" << std::chrono::duration_cast<Nanoseconds>(prepared - started).count()
@@ -236,4 +211,86 @@ int main(int argc, char **argv) {
                  << '\n';
   }
   return 0;
+}
+
+constexpr unsigned MaxFrame = 4 * 1024 * 1024;
+
+void reply(char status, StringRef payload) {
+  const auto size = payload.size();
+  const char header[] = {status, char(size >> 24), char(size >> 16),
+                         char(size >> 8), char(size)};
+  std::cout.write(header, sizeof(header));
+  std::cout.write(payload.data(), size);
+  std::cout.flush();
+}
+
+int serve(MLIRContext &context) {
+  std::cout.write("EP01", 4);
+  std::cout.flush();
+  for (;;) {
+    unsigned char header[4];
+    if (!std::cin.read(reinterpret_cast<char *>(header), sizeof(header)))
+      return std::cin.eof() && std::cin.gcount() == 0 ? 0 : 1;
+    unsigned size = (unsigned(header[0]) << 24) | (unsigned(header[1]) << 16) |
+                    (unsigned(header[2]) << 8) | unsigned(header[3]);
+    if (size == 0)
+      return 0;
+    if (size > MaxFrame)
+      return 1;
+    std::string input(size, '\0');
+    if (!std::cin.read(input.data(), size))
+      return 1;
+    if (input.find('\0') != std::string::npos) {
+      reply('E', "embedded NUL in MLIR");
+      continue;
+    }
+    std::string output;
+    llvm::raw_string_ostream source(output);
+    if (translate(context, llvm::MemoryBuffer::getMemBufferCopy(input, "request"),
+                  source) != 0) {
+      reply('E', "MLIR translation failed");
+    } else if (output.size() > MaxFrame) {
+      reply('E', "Python source exceeds frame limit");
+    } else {
+      reply('O', output);
+    }
+    if (!std::cout)
+      return 1;
+  }
+}
+} // namespace
+
+int main(int argc, char **argv) {
+  if (argc != 3) {
+    llvm::errs() << "usage: ridger-emitpy IRDL INPUT | IRDL --serve | --literal STRING\n";
+    return 2;
+  }
+  DialectRegistry registry;
+  registry.insert<func::FuncDialect, irdl::IRDLDialect, py::EmitPyDialect>();
+  MLIRContext context(registry);
+  context.disableMultithreading();
+  context.getOrLoadDialect<py::EmitPyDialect>();
+  if (StringRef(argv[1]) == "--literal") {
+    OpBuilder b(&context);
+    auto loc = b.getUnknownLoc();
+    OwningOpRef<ModuleOp> output(ModuleOp::create(loc));
+    b.setInsertionPointToStart(output->getBody());
+    Lowering adapter{b, loc, py::OpaqueType::get(&context, "object")};
+    adapter.path({argv[2]});
+    return failed(verify(*output)) ||
+           failed(py::translateToPython(output->getOperation(), llvm::outs()));
+  }
+
+  auto definitions = parseSourceFile<ModuleOp>(argv[1], &context);
+  if (!definitions || failed(irdl::loadDialects(*definitions)))
+    return 1;
+  if (StringRef(argv[2]) == "--serve")
+    return serve(context);
+  auto buffer = llvm::MemoryBuffer::getFileOrSTDIN(argv[2]);
+  if (!buffer) {
+    llvm::errs() << buffer.getError().message() << '\n';
+    return 1;
+  }
+
+  return translate(context, std::move(*buffer), llvm::outs());
 }
