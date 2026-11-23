@@ -5,8 +5,8 @@
 #ifndef TTMLIR_DIALECT_EMITPY_IR_EMITPYTYPES_H
 #define TTMLIR_DIALECT_EMITPY_IR_EMITPYTYPES_H
 
-#include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
 
+#include "mlir/IR/Types.h"
 #define GET_TYPEDEF_CLASSES
 #include "ttmlir/Dialect/EmitPy/IR/EmitPyOpsTypes.h.inc"
 

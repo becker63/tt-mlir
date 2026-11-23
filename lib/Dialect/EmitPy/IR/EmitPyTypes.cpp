@@ -7,6 +7,7 @@
 #include "ttmlir/Dialect/EmitPy/IR/EmitPy.h"
 
 #include "mlir/IR/DialectImplementation.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/Types.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/LogicalResult.h"
@@ -49,14 +50,14 @@ void DictType::print(::mlir::AsmPrinter &printer) const {
 
   if (keyType || valueType) {
     printer << "<";
-    auto opaqueType = dyn_cast<OpaqueType>(keyType);
+    auto opaqueType = mlir::dyn_cast<OpaqueType>(keyType);
     if (!opaqueType || opaqueType.getValue() != "Any") {
       printer.printType(keyType);
     } else {
       printer << "Any";
     }
     printer << ", ";
-    opaqueType = dyn_cast<OpaqueType>(valueType);
+    opaqueType = mlir::dyn_cast<OpaqueType>(valueType);
     if (!opaqueType || opaqueType.getValue() != "Any") {
       printer.printType(valueType);
     } else {

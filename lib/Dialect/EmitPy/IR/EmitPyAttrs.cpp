@@ -5,9 +5,9 @@
 #include "ttmlir/Dialect/EmitPy/IR/EmitPyAttrs.h"
 
 #include "ttmlir/Dialect/EmitPy/IR/EmitPy.h"
-#include "ttmlir/Utils.h"
 
 #include "mlir/IR/DialectImplementation.h"
+#include "mlir/IR/Builders.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir::tt::emitpy;
